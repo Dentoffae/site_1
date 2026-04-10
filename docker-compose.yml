@@ -1,0 +1,166 @@
+# Autobizlab — контур: Nginx → фронт + API; БД только внутри; Registry снаружи для push образов.
+# Запуск: docker compose --env-file .env up -d
+# Создайте .env из .env.example
+
+name: autobizlab
+
+services:
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+    depends_on:
+      - pgadmin
+      - registry
+    networks:
+      - edge
+      - app_internal
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autobizlab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-autobizlab}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Сначала пользователь из .env — иначе при admin+POSTGRES_PASSWORD каждые 5s в лог летит FATAL по autobizlab.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-autobizlab} -d postgres || pg_isready -U autobizlab -d postgres || pg_isready -U postgres -d postgres",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app_internal
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    # Порт наружу не публикуем — доступ только из backend/pgAdmin внутри контура
+
+  # Одноразовый прогон при up: создаёт/обновляет роль из POSTGRES_USER, если initdb её не создал.
+  postgres-ensure-user:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autobizlab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./scripts/ensure-postgres-user.sh:/ensure-postgres-user.sh:ro
+    networks:
+      - app_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/ensure-postgres-user.sh"]
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:?set PGADMIN_DEFAULT_EMAIL in .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?set PGADMIN_DEFAULT_PASSWORD in .env}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      # Работа за reverse proxy по пути /pgadmin/
+      PGADMIN_SCRIPT_NAME: "/pgadmin"
+      # Преднастройка подключения к postgres (см. pgadmin/servers.json). При True список серверов
+      # при каждом старте совпадает с файлом (добавленные вручную в UI при перезапуске сотрутся).
+      PGADMIN_REPLACE_SERVERS_ON_STARTUP: "True"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-ensure-user:
+        condition: service_completed_successfully
+    networks:
+      - app_internal
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    # Веб-интерфейс только через Nginx: http://<хост>/pgadmin/
+
+  # ---------------------------------------------------------------------------
+  # Backend (API): раскомментируйте, когда будет образ или Dockerfile.
+  # Подключение к БД: postgres:5432, пользователь/БД из .env
+  # Порт приложения внутри сети, например 8080 — тогда в nginx раскомментируйте proxy_pass.
+  #
+  # backend:
+  #   image: <ваш_хост>/autobizlab-backend:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - app_internal
+  #   # ports: не публикуйте — доступ только через Nginx → location /api/
+  # ---------------------------------------------------------------------------
+
+  # containrrr/watchtower устарел для Docker 29+ (API client 1.25); форк с актуальным клиентом:
+  watchtower:
+    image: nickfedor/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Учётные данные для pull из вашего private registry (после docker login на хосте):
+      # - /root/.docker/config.json:/config.json:ro
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_STOPPED: "false"
+      # WATCHTOWER_DOCKER_CONFIG_PATH: /config.json
+    # С меткой enable=true обновляются только nginx/postgres/pgadmin; registry и сам watchtower — с enable=false
+    command: --label-enable
+    networks:
+      - edge
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  registry:
+    image: registry:2.8
+    restart: unless-stopped
+    # Публичный доступ извне: через Nginx → location /v2/ (порт 80 на хосте). Не публикуем :5000 на
+    # интерфейсе по умолчанию — меньше поверхность атаки и один способ входа (см. nginx/conf.d/default.conf).
+    # Раскомментируйте для прямого доступа (LAN/отладка): тогда в клиенте часто нужен insecure-registries.
+    # ports:
+    #   - "5000:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Autobizlab Registry"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      # Корректные редиректы при работе за reverse-proxy (Nginx)
+      REGISTRY_HTTP_RELATIVEURLS: "false"
+      # Опционально TLS прямо в registry (если не используете Nginx с SSL):
+      # REGISTRY_HTTP_TLS_CERTIFICATE: /certs/fullchain.pem
+      # REGISTRY_HTTP_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - registry_data:/var/lib/registry
+      - ./registry/auth/htpasswd:/auth/htpasswd:ro
+      # - ./registry/certs:/certs:ro
+    networks:
+      - edge
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+networks:
+  edge:
+    driver: bridge
+  app_internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  registry_data:

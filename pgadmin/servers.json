@@ -1,0 +1,17 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "PostgreSQL (Autobizlab)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "autobizlab_db",
+      "Username": "admin",
+      "Comment": "Сервис postgres в docker-compose; пароль — POSTGRES_PASSWORD из .env",
+      "ConnectionParameters": {
+        "sslmode": "prefer",
+        "connect_timeout": 15
+      }
+    }
+  }
+}
